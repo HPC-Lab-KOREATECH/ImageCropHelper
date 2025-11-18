@@ -91,9 +91,10 @@ static inline void ApplyAspectByMode(ImVec4& b, BoxMode mode, const ImVec4& area
 }
 
 void updateMouse() {
-	ImGuiIO& io = ImGui::GetIO();
-	if (textureName == "-1") return;
-	if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_squareBaseMode) return; // placing square base ROI disables drag selection
+    if (textureName == "-1") return;
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
 
 	float mouseX = io.MousePos.x;
 	float mouseY = io.MousePos.y;
@@ -105,22 +106,36 @@ void updateMouse() {
 		if (mouseX <= area.x || mouseX >= area.x + area.z) return;
 		if (mouseY <= area.y || mouseY >= area.y + area.w) return;
 
-		isDown = true;
-		currBox.x = (mouseX - area.x) / area.z;
-		currBox.y = (mouseY - area.y) / area.w;
-		currBox.z = currBox.x;
-		currBox.w = currBox.y;
-	}
+        isDown = true;
+        currBox.x = (mouseX - area.x) / area.z;
+        currBox.y = (mouseY - area.y) / area.w;
+        if (g_squareBaseROIEnabled) {
+            currBox.x = std::clamp(currBox.x, g_squareBaseROI.x, g_squareBaseROI.z);
+            currBox.y = std::clamp(currBox.y, g_squareBaseROI.y, g_squareBaseROI.w);
+        }
+        currBox.z = currBox.x;
+        currBox.w = currBox.y;
+    }
 
 	// 2) 드래그 중: 끝점 갱신 + 모드 보정 (★ 실시간 보정)
-	if (io.MouseDown[0] && isDown) {
-		ImVec4 b = currBox;
-		b.z = std::clamp((mouseX - area.x) / area.z, 0.f, 1.f);
-		b.w = std::clamp((mouseY - area.y) / area.w, 0.f, 1.f);
+    if (io.MouseDown[0] && isDown) {
+        ImVec4 b = currBox;
+        b.z = std::clamp((mouseX - area.x) / area.z, 0.f, 1.f);
+        b.w = std::clamp((mouseY - area.y) / area.w, 0.f, 1.f);
+        if (g_squareBaseROIEnabled) {
+            b.z = std::clamp(b.z, g_squareBaseROI.x, g_squareBaseROI.z);
+            b.w = std::clamp(b.w, g_squareBaseROI.y, g_squareBaseROI.w);
+        }
 
-		ApplyAspectByMode(b, g_boxMode, area, imageSize[textureName]);
-		currBox = b;
-	}
+        ApplyAspectByMode(b, g_boxMode, area, imageSize[textureName]);
+        if (g_squareBaseROIEnabled) {
+            b.x = std::clamp(b.x, g_squareBaseROI.x, g_squareBaseROI.z);
+            b.z = std::clamp(b.z, g_squareBaseROI.x, g_squareBaseROI.z);
+            b.y = std::clamp(b.y, g_squareBaseROI.y, g_squareBaseROI.w);
+            b.w = std::clamp(b.w, g_squareBaseROI.y, g_squareBaseROI.w);
+        }
+        currBox = b;
+    }
 
 	// 3) 마우스 뗄 때: 최종 정리 + 모드 보정(한 번 더 안전하게)
 	if (!io.MouseDown[0]) {
@@ -136,9 +151,47 @@ void updateMouse() {
 			float y1 = std::max(currBox.y, currBox.w);
 			currBox = ImVec4(x0, y0, x1, y1);
 
-			ApplyAspectByMode(currBox, g_boxMode, area, imageSize[textureName]);
-		}
-	}
+            ApplyAspectByMode(currBox, g_boxMode, area, imageSize[textureName]);
+            if (g_squareBaseROIEnabled) {
+                currBox.x = std::clamp(currBox.x, g_squareBaseROI.x, g_squareBaseROI.z);
+                currBox.z = std::clamp(currBox.z, g_squareBaseROI.x, g_squareBaseROI.z);
+                currBox.y = std::clamp(currBox.y, g_squareBaseROI.y, g_squareBaseROI.w);
+                currBox.w = std::clamp(currBox.w, g_squareBaseROI.y, g_squareBaseROI.w);
+            }
+        }
+    }
+}
+
+// Mouse-follow temporary square ROI placement; click to set ROI (no immediate crop)
+void updateSquareBaseMode() {
+    if (!g_squareBaseMode) { g_squarePreviewBox = ImVec4(0,0,0,0); return; }
+    if (textureName == "-1") return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+
+    auto sz = imageSize[textureName];
+    float iw = (float)sz.first, ih = (float)sz.second;
+    if (iw <= 0 || ih <= 0) return;
+    float sw = 1.0f, sh = 1.0f;
+    if (iw <= ih) { sw = 1.0f; sh = iw / ih; }
+    else { sw = ih / iw; sh = 1.0f; }
+
+    float mx = (io.MousePos.x - area.x) / area.z;
+    float my = (io.MousePos.y - area.y) / area.w;
+    float left = std::clamp(mx - sw * 0.5f, 0.0f, 1.0f - sw);
+    float top  = std::clamp(my - sh * 0.5f, 0.0f, 1.0f - sh);
+    g_squarePreviewBox = ImVec4(left, top, left + sw, top + sh);
+
+    bool inside = (io.MousePos.x > area.x && io.MousePos.x < area.x + area.z &&
+                   io.MousePos.y > area.y && io.MousePos.y < area.y + area.w);
+    if (inside && ImGui::IsMouseClicked(0)) {
+        g_squareBaseROIEnabled = true;
+        g_squareBaseROI = g_squarePreviewBox;
+        g_squareBaseMode = false;
+        g_squarePreviewBox = ImVec4(0,0,0,0);
+        // restore previous BoxMode when exiting placement
+        if (g_roiPrevBoxModeSaved) { g_boxMode = g_roiPrevBoxMode; g_roiPrevBoxModeSaved = false; }
+    }
 }
 
 
@@ -156,6 +209,7 @@ void updateKeyboard(std::string name) {
 		glDeleteTextures(1, &imagesGL[name]);
 		imagesGL.erase(name);
 		imagesCV.erase(name);
+		imagesCVOriginal.erase(name);
 		imageSize.erase(name);
 	}
 	if (io.KeysDown['X'] && textureName == "-1") {
@@ -186,5 +240,37 @@ void updateKeyboard() {
 				return;
 		}
 		boxList.push_back({ currBox, color });
-	}
+	 }
+}
+
+// Non-ctrl hotkeys for quick square base ROI control
+inline void updateQuickKeys() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (textureName == "-1") return; // only in capture mode
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+
+    static bool prevQ = false;
+    static bool prevE = false;
+    bool q = io.KeysDown['Q'];
+    bool e = io.KeysDown['E'];
+
+    if (q && !prevQ) {
+        // Toggle placement preview mode and sync Box Mode to Square while active
+        if (!g_squareBaseMode) {
+            if (!g_roiPrevBoxModeSaved) { g_roiPrevBoxMode = g_boxMode; g_roiPrevBoxModeSaved = true; }
+            g_squareBaseMode = true;
+            g_boxMode = BoxMode::Square;
+        } else {
+            g_squareBaseMode = false;
+            g_squarePreviewBox = ImVec4(0,0,0,0);
+            if (g_roiPrevBoxModeSaved) { g_boxMode = g_roiPrevBoxMode; g_roiPrevBoxModeSaved = false; }
+        }
+    }
+    if (e && !prevE) {
+        // Clear existing ROI quickly
+        g_squareBaseROIEnabled = false;
+        g_squareBaseROI = ImVec4(0,0,0,0);
+    }
+
+    prevQ = q; prevE = e;
 }

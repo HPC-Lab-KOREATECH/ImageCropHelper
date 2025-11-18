@@ -13,8 +13,9 @@
 #include "imgui_impl_win32.h"
 #include "opencv.hpp"
 #include "utils.h"
-#include "update.h"
+#include "GlocalVariable.h" // ensure all global states are visible
 #include "cropImage.h"
+#include "update.h"
 
 bool CreateDeviceWGL(HWND hWnd, WGL_WindowData* data);
 void CleanupDeviceWGL(HWND hWnd, WGL_WindowData* data);
@@ -23,6 +24,7 @@ void openFiles();
 void getArea();
 void clearImage();
 void drawBox(ImVec4 box, ImVec4 inColor);
+void drawFilledBox(ImVec4 box, ImVec4 inColor);
 void drawImage();
 void optionGUI();
 void imageSelectGUI();
@@ -30,6 +32,13 @@ void imageGUI();
 void render();
 void callbackSave();
 void resetAll();
+void updateSquareBaseMode();
+void updateQuickKeys();
+
+// Helpers for flip management
+static cv::Mat applyFlips(const cv::Mat& rgb);
+static void updateTextureFromRGB(const std::string& name, const cv::Mat& rgb);
+static void rebuildAllFromOriginals();
 
 int main(int, char**) {
 	wc = { sizeof(wc), CS_OWNDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, L"Crop Image", NULL };
@@ -78,9 +87,11 @@ int main(int, char**) {
 		scale = 1.0f;
 		getArea();
 		updateKeyboard();
+		updateQuickKeys();
 		imageSelectGUI();
 		optionGUI();
 		imageGUI();
+		updateSquareBaseMode();
 		updateMouse();
 		render();
 	}
@@ -196,10 +207,15 @@ void openFiles() {
 				wprintf(L"Exist : %s\n", filePath.c_str());
 				continue;
 			}
-			cv::Mat image = cv::imread(path.string(), cv::IMREAD_COLOR);
-			cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
-			cv::Mat img;
-			cv::cvtColor(image, img, cv::COLOR_RGB2RGBA);
+            cv::Mat image = cv::imread(path.string(), cv::IMREAD_COLOR);
+            cv::cvtColor(image, image, cv::COLOR_BGR2RGB); // now RGB
+            // keep original (RGB)
+            imagesCVOriginal[str] = image.clone();
+            // apply current global flip to create working copy
+            cv::Mat work = applyFlips(image);
+            // convert to RGBA for GL upload
+            cv::Mat img;
+            cv::cvtColor(work, img, cv::COLOR_RGB2RGBA);
 			
 			
 			unsigned int texture;
@@ -214,14 +230,14 @@ void openFiles() {
 			glFinish();
 			glBindTexture(GL_TEXTURE_2D, 0);
 
-			imagesGL.insert({ str, texture });
-			imageSize.insert({ str, {image.cols,image.rows}});
-			onWindow.insert({ str, false });
-			imagesCV.insert({ str, image });
-			wprintf(L"Add : %s\n", filePath.c_str());
-		}
-	}
-	free(szFile);
+            imagesGL.insert({ str, texture });
+            imageSize.insert({ str, {work.cols,work.rows}});
+            onWindow.insert({ str, false });
+            imagesCV.insert({ str, work });
+            wprintf(L"Add : %s\n", filePath.c_str());
+        }
+    }
+    free(szFile);
 }
 
 void clearImage() {
@@ -281,9 +297,35 @@ void drawBox(ImVec4 box, ImVec4 inColor) {
 }
 
 
+void drawFilledBox(ImVec4 box, ImVec4 inColor) {
+    // Convert normalized [0..1] box to NDC as in drawBox
+    ImVec4 b = box;
+    b.x = (b.x - 0.5f) * 2.f;
+    b.y = (b.y - 0.5f) * 2.f;
+    b.z = (b.z - 0.5f) * 2.f;
+    b.w = (b.w - 0.5f) * 2.f;
+    b.w *= -1.f;
+    b.y *= -1.f;
+    // Draw solid color without texturing so color alpha shows up reliably
+    GLboolean wasTex = glIsEnabled(GL_TEXTURE_2D);
+    if (wasTex) glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(inColor.x, inColor.y, inColor.z, inColor.w);
+    glBegin(GL_QUADS);
+    glVertex2f(b.x, b.y);
+    glVertex2f(b.z, b.y);
+    glVertex2f(b.z, b.w);
+    glVertex2f(b.x, b.w);
+    glEnd();
+    glDisable(GL_BLEND);
+    if (wasTex) glEnable(GL_TEXTURE_2D);
+    glColor4f(1, 1, 1, 1);
+}
+
 void optionGUI() {
-	ImGui::Begin("Option");
-	ImGui::SetWindowPos({ 0, selectWindowSize.y });
+    ImGui::Begin("Option");
+    ImGui::SetWindowPos({ 0, selectWindowSize.y });
 	char str[100];
 	sprintf_s(str, 100, "Box List Size : %zu", boxList.size());
 	ImGui::Text(str);
@@ -295,8 +337,18 @@ void optionGUI() {
 	ImGui::Text("Reset Capture : ctrl + r");
 	ImGui::Separator();
 	ImGui::Text("Close Image : ctrl + w");
-	ImGui::Text("Delete Image : ctrl + z");
-	ImGui::Separator();
+    ImGui::Text("Delete Image : ctrl + z");
+    ImGui::Separator();
+
+    // Flip options (apply immediately to all images)
+    bool prevH = g_flipHorizontal;
+    bool prevV = g_flipVertical;
+    ImGui::Checkbox("Flip Horizontal", &g_flipHorizontal);
+    ImGui::SameLine();
+    ImGui::Checkbox("Flip Vertical", &g_flipVertical);
+    if (prevH != g_flipHorizontal || prevV != g_flipVertical) {
+        rebuildAllFromOriginals();
+    }
 
 	//ImGui::Checkbox("Free", &isFree);
 	// Box mode
@@ -312,7 +364,27 @@ void optionGUI() {
 	ImGui::DragInt("Box Size", &boxSize, 1, 1, 20);
     ImGui::ColorEdit4("Color", (float*)&color);
     ImGui::Separator();
-	// Save options
+    // Square base mode (temporary ROI from short side)
+    bool prevROI = g_squareBaseMode;
+    ImGui::Checkbox("Square Base Mode (short side)", &g_squareBaseMode);
+    if (prevROI != g_squareBaseMode) {
+        if (g_squareBaseMode) {
+            if (!g_roiPrevBoxModeSaved) { g_roiPrevBoxMode = g_boxMode; g_roiPrevBoxModeSaved = true; }
+            g_boxMode = BoxMode::Square;
+        } else {
+            if (g_roiPrevBoxModeSaved) { g_boxMode = g_roiPrevBoxMode; g_roiPrevBoxModeSaved = false; }
+        }
+    }
+    ImGui::SameLine();
+    if (g_squareBaseROIEnabled) {
+        if (ImGui::Button("Clear Square Base")) {
+            g_squareBaseROIEnabled = false;
+            g_squareBaseROI = ImVec4(0,0,0,0);
+        }
+    }
+    ImGui::TextDisabled("Temporary square ROI; applied only on Save");
+    ImGui::Separator();
+    // Save options
 	ImGui::Checkbox("Save Right Grid (1/2)", &g_saveComposeRight);
 	ImGui::TextDisabled("Compose crops to the right (2 per column)");
     // Bottom-right aligned Save/Reset buttons
@@ -386,29 +458,40 @@ void drawImage() {
 	glPopMatrix();
 }
 
+
 void render() {
-	ImGui::Render();
-	glEnable(GL_TEXTURE_2D);
-	glViewport(0, 0, g_Width, g_Height);
-	glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
-	glClear(GL_COLOR_BUFFER_BIT);
-	glColor3f(1.0f, 1.0f, 1.0f);
-	if (textureName != "-1") {
-		glViewport(area.x, area.y, area.z, area.w);
-		glBindTexture(GL_TEXTURE_2D, imagesGL[textureName]);
-		drawImage();
-		glBindTexture(GL_TEXTURE_2D, 0);
-		drawBox(currBox, color);
-		for (auto& it : boxList)
-			drawBox(it.first, it.second);
-	}
-	ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-	::SwapBuffers(g_MainWindow.hDC);
+    ImGui::Render();
+    glEnable(GL_TEXTURE_2D);
+    glViewport(0, 0, g_Width, g_Height);
+    glClearColor(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glColor3f(1.0f, 1.0f, 1.0f);
+    if (textureName != "-1") {
+        glViewport(area.x, area.y, area.z, area.w);
+        glBindTexture(GL_TEXTURE_2D, imagesGL[textureName]);
+        drawImage();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        // draw persisted ROI behind current box outlines
+        if (g_squareBaseROIEnabled) {
+            drawFilledBox(g_squareBaseROI, ImVec4(1,1,1,0.12f));
+            drawBox(g_squareBaseROI, ImVec4(1,1,1,0.6f));
+        }
+        drawBox(currBox, color);
+        for (auto& it : boxList)
+            drawBox(it.first, it.second);
+        // overlays for square base (preview and persisted ROI)
+        if (g_squareBaseMode) {
+            drawFilledBox(g_squarePreviewBox, ImVec4(1,1,1,0.25f));
+            drawBox(g_squarePreviewBox, ImVec4(1,1,1,0.9f));
+        }
+    }
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    ::SwapBuffers(g_MainWindow.hDC);
 }
 
 void callbackSave() {
-	std::wstring buffer;
-	buffer.resize(MAX_PATH);
+    std::wstring buffer;
+    buffer.resize(MAX_PATH);
 	GetModuleFileName(NULL, (LPWSTR)buffer.c_str(), MAX_PATH);
 	buffer.resize(buffer.rfind(L'\\'));
 	buffer += L"\\Result";
@@ -419,34 +502,83 @@ void callbackSave() {
 	buffer += timeString.str();
 	initSaveFolder(buffer);
 
-	
-	for (auto& it : imagesCV) {
-		int cropI = 0;
-		auto& name = it.first;
-		auto mat = it.second.clone();
-        std::vector<std::pair<ImVec4, ImVec4>> entries;
-		for (auto& save : boxList) {
-			cropI++;
-			drawRect(&mat, save.first, save.second, imageSize[name], boxSize);
-			std::string cropName = std::to_string(cropI) + "_" + name;
-			saveImage(cropMat(&it.second, save.first, imageSize[name]), buffer, cropName);
-            entries.push_back(save);
-		}
-		saveImage(mat, buffer, name);
+    
+    for (auto& it : imagesCV) {
+        int cropI = 0;
+        auto& name = it.first;
+        bool applyROI = g_squareBaseROIEnabled; // apply ROI to all images when enabled
 
-        // Optionally save composed right-side grid image
-        if (g_saveComposeRight && !entries.empty()) {
-            cv::Mat composed = composeRightGrid(&it.second, entries, imageSize[name], g_boxMode, boxSize, g_tileBorderSize, g_refHeight);
-            std::string gridName = std::string("grid_") + name;
-            saveImage(composed, buffer, gridName);
+        if (!applyROI) {
+            auto mat = it.second.clone();
+            std::vector<std::pair<ImVec4, ImVec4>> entries;
+            for (auto& save : boxList) {
+                cropI++;
+                drawRect(&mat, save.first, save.second, imageSize[name], boxSize);
+                std::string cropName = std::to_string(cropI) + "_" + name;
+                saveImage(cropMat(&it.second, save.first, imageSize[name]), buffer, cropName);
+                entries.push_back(save);
+            }
+            saveImage(mat, buffer, name);
+            if (g_saveComposeRight && !entries.empty()) {
+                cv::Mat composed = composeRightGrid(&it.second, entries, imageSize[name], g_boxMode, boxSize, g_tileBorderSize, g_refHeight);
+                std::string gridName = std::string("grid_") + name;
+                saveImage(composed, buffer, gridName);
+            }
+        } else {
+            // compute per-image ROI from global center, using this image's aspect (shorter side)
+            ImVec4 roiRef = g_squareBaseROI;
+            float cx = (roiRef.x + roiRef.z) * 0.5f;
+            float cy = (roiRef.y + roiRef.w) * 0.5f;
+            auto szImg = imageSize[name];
+            float iw = (float)szImg.first, ih = (float)szImg.second;
+            float sw = 1.0f, sh = 1.0f; // normalized square size per image
+            if (iw <= ih) { sw = 1.0f; sh = (iw > 0 ? iw / ih : 1.0f); }
+            else { sw = (ih > 0 ? ih / iw : 1.0f); sh = 1.0f; }
+            float left = std::clamp(cx - sw * 0.5f, 0.0f, 1.0f - sw);
+            float top  = std::clamp(cy - sh * 0.5f, 0.0f, 1.0f - sh);
+            ImVec4 roi = ImVec4(left, top, left + sw, top + sh);
+            // compute ROI-local save
+            cv::Mat base = cropMat(&it.second, roi, imageSize[name]);
+            std::pair<int,int> roiSize = { base.cols, base.rows };
+            auto toLocal = [&](const ImVec4& b)->ImVec4 {
+                // intersect with roi then map to local coords
+                float x0 = std::max(b.x, roi.x), y0 = std::max(b.y, roi.y);
+                float x1 = std::min(b.z, roi.z), y1 = std::min(b.w, roi.w);
+                float rw = (roi.z - roi.x);
+                float rh = (roi.w - roi.y);
+                if (rw <= 0 || rh <= 0) return ImVec4(0,0,0,0);
+                x0 = (x0 - roi.x) / rw; x1 = (x1 - roi.x) / rw;
+                y0 = (y0 - roi.y) / rh; y1 = (y1 - roi.y) / rh;
+                x0 = std::clamp(x0, 0.f, 1.f); x1 = std::clamp(x1, 0.f, 1.f);
+                y0 = std::clamp(y0, 0.f, 1.f); y1 = std::clamp(y1, 0.f, 1.f);
+                return ImVec4(std::min(x0,x1), std::min(y0,y1), std::max(x0,x1), std::max(y0,y1));
+            };
+            std::vector<std::pair<ImVec4, ImVec4>> entries;
+            for (auto& save : boxList) {
+                ImVec4 local = toLocal(save.first);
+                entries.push_back({ local, save.second });
+                cropI++;
+                std::string cropName = std::to_string(cropI) + "_" + name;
+                saveImage(cropMat(&base, local, roiSize), buffer, cropName);
+            }
+            // draw boxes on ROI base (copy first)
+            cv::Mat mat = base.clone();
+            for (auto& e : entries) drawRect(&mat, e.first, e.second, roiSize, boxSize);
+            saveImage(mat, buffer, name);
+            if (g_saveComposeRight && !entries.empty()) {
+                cv::Mat composed = composeRightGrid(&base, entries, roiSize, g_boxMode, boxSize, g_tileBorderSize, g_refHeight);
+                std::string gridName = std::string("grid_") + name;
+                saveImage(composed, buffer, gridName);
+            }
         }
-	}
+    }
 }
 
 void resetAll() {
 	// 1) GPU 텍스처 정리 + 이미지 맵들 비우기
 	clearImage();                 // 이미 glDeleteTextures + imagesGL.clear() 수행
-	imagesCV.clear();
+    imagesCV.clear();
+    imagesCVOriginal.clear();
 	imageSize.clear();
 	onWindow.clear();
 
@@ -464,6 +596,12 @@ void resetAll() {
 	color = ImVec4(1, 1, 1, 1);    // 박스 색 기본(화이트)
 	g_boxMode = BoxMode::Free;    // enum 쓰는 경우: 기본 모드(원하는 값)
 
+	// Square ROI state
+	g_squareBaseMode = false;
+	g_squarePreviewBox = ImVec4(0,0,0,0);
+	g_squareBaseROIEnabled = false;
+	g_squareBaseROI = ImVec4(0,0,0,0);
+
 	// 배경색 등도 초기화하고 싶다면:
 	// clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
@@ -476,3 +614,40 @@ void resetAll() {
 
 
 
+// --- Flip helpers ---
+static cv::Mat applyFlips(const cv::Mat& rgb) {
+    if (rgb.empty()) return rgb;
+    if (!g_flipHorizontal && !g_flipVertical) return rgb.clone();
+    cv::Mat out;
+    int code = -2;
+    if (g_flipHorizontal && g_flipVertical) code = -1; // both
+    else if (g_flipHorizontal) code = 1;               // horizontal
+    else if (g_flipVertical) code = 0;                 // vertical
+    if (code == -2) return rgb.clone();
+    cv::flip(rgb, out, code);
+    return out;
+}
+
+static void updateTextureFromRGB(const std::string& name, const cv::Mat& rgb) {
+    auto it = imagesGL.find(name);
+    if (it == imagesGL.end()) return;
+    if (rgb.empty()) return;
+    cv::Mat rgba;
+    cv::cvtColor(rgb, rgba, cv::COLOR_RGB2RGBA);
+    glBindTexture(GL_TEXTURE_2D, it->second);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rgba.cols, rgba.rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data);
+    glFlush();
+    glFinish();
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static void rebuildAllFromOriginals() {
+    for (const auto& kv : imagesCVOriginal) {
+        const std::string& name = kv.first;
+        const cv::Mat& orig = kv.second;
+        cv::Mat work = applyFlips(orig);
+        imagesCV[name] = work;
+        // size remains unchanged by flip
+        updateTextureFromRGB(name, work);
+    }
+}
