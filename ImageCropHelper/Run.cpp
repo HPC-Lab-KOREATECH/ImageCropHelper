@@ -9,6 +9,7 @@
 #include <tchar.h>
 #include <chrono>
 #include <vector>
+#include <fstream>
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_win32.h"
 #include "opencv.hpp"
@@ -26,6 +27,8 @@ void clearImage();
 void drawBox(ImVec4 box, ImVec4 inColor);
 void drawFilledBox(ImVec4 box, ImVec4 inColor);
 void drawImage();
+void updateZoom();
+void updatePan();
 void optionGUI();
 void imageSelectGUI();
 void imageGUI();
@@ -34,11 +37,16 @@ void callbackSave();
 void resetAll();
 void updateSquareBaseMode();
 void updateQuickKeys();
+void updateBoxNudge();
 
 // Helpers for flip management
 static cv::Mat applyFlips(const cv::Mat& rgb);
 static void updateTextureFromRGB(const std::string& name, const cv::Mat& rgb);
 static void rebuildAllFromOriginals();
+static void rebuildImageFromOriginal(const std::string& name);
+static cv::Mat applyRotation(const cv::Mat& rgb, int steps);
+static void loadColorPresets();
+static void saveColorPresets();
 
 int main(int, char**) {
 	wc = { sizeof(wc), CS_OWNDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, L"Crop Image", NULL };
@@ -66,6 +74,7 @@ int main(int, char**) {
 	ImGui::StyleColorsDark();
 	ImGui_ImplWin32_InitForOpenGL(hwnd);
 	ImGui_ImplOpenGL3_Init();
+    loadColorPresets();
 
 	while (!done) {
 		MSG msg;
@@ -84,10 +93,12 @@ int main(int, char**) {
 		ImGui_ImplWin32_NewFrame();
 		ImGui::NewFrame();
 
-		scale = 1.0f;
+		updateZoom();
+        updatePan();
 		getArea();
 		updateKeyboard();
 		updateQuickKeys();
+        updateBoxNudge();
 		imageSelectGUI();
 		optionGUI();
 		imageGUI();
@@ -97,6 +108,7 @@ int main(int, char**) {
 	}
 
 	clearImage();
+    saveColorPresets();
 	ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplWin32_Shutdown();
 	ImGui::DestroyContext();
@@ -223,8 +235,8 @@ void openFiles() {
 			glBindTexture(GL_TEXTURE_2D, texture);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.cols, img.rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data);
 			glFlush();
 			glFinish();
@@ -234,6 +246,7 @@ void openFiles() {
             imageSize.insert({ str, {work.cols,work.rows}});
             onWindow.insert({ str, false });
             imagesCV.insert({ str, work });
+            g_rotationSteps[str] = 0;
             wprintf(L"Add : %s\n", filePath.c_str());
         }
     }
@@ -246,28 +259,70 @@ void clearImage() {
 	imagesGL.clear();
 }
 
+static std::filesystem::path getPresetPath() {
+    std::wstring buffer;
+    buffer.resize(MAX_PATH);
+    GetModuleFileName(NULL, (LPWSTR)buffer.c_str(), MAX_PATH);
+    buffer.resize(buffer.rfind(L'\\'));
+    std::filesystem::path p(buffer);
+    return p / "color_presets.txt";
+}
+
+static void loadColorPresets() {
+    std::filesystem::path p = getPresetPath();
+    std::ifstream in(p, std::ios::in);
+    if (!in.good()) return;
+    for (int i = 0; i < 6; ++i) {
+        float r = 0, g = 0, b = 0, a = 1;
+        if (!(in >> r >> g >> b >> a)) break;
+        r = std::clamp(r, 0.0f, 1.0f);
+        g = std::clamp(g, 0.0f, 1.0f);
+        b = std::clamp(b, 0.0f, 1.0f);
+        a = std::clamp(a, 0.0f, 1.0f);
+        g_colorPresets[i] = ImVec4(r, g, b, a);
+    }
+}
+
+static void saveColorPresets() {
+    std::filesystem::path p = getPresetPath();
+    std::ofstream out(p, std::ios::out | std::ios::trunc);
+    if (!out.good()) return;
+    for (int i = 0; i < 6; ++i) {
+        const ImVec4& c = g_colorPresets[i];
+        out << c.x << ' ' << c.y << ' ' << c.z << ' ' << c.w << '\n';
+    }
+}
+
 void getArea() {
 	std::pair<int, int> size;
 	int middle_w = g_Width / 2;
 	int middle_h = g_Height / 2;
+	scale = 1.0f;
 	if (textureName != "-1") {
 		size = imageSize[textureName];
+        float dispW = (float)size.first;
+        float dispH = (float)size.second;
 
-		while (size.first < 800 || size.second < 800) {
-			size.first *= 1.1f;
-			size.second *= 1.1f;
+		while (dispW < 800 || dispH < 800) {
+			dispW *= 1.1f;
+			dispH *= 1.1f;
 			scale *= 1.1f;
 		}
 
-		while (size.first > 1200 || size.second > 1200) {
-			size.first *= 0.9f;
-			size.second *= 0.9f;
+		while (dispW > 1200 || dispH > 1200) {
+			dispW *= 0.9f;
+			dispH *= 0.9f;
 			scale *= 0.9f;
 		}
-		area.x = middle_w = middle_w - size.first / 2;
-		area.y = middle_h - size.second / 2;
-		area.z = size.first;
-		area.w = size.second;
+
+        dispW *= g_zoom;
+        dispH *= g_zoom;
+        scale *= g_zoom;
+
+		area.x = middle_w = middle_w - (int)(dispW / 2) + (int)g_pan.x;
+		area.y = middle_h - (int)(dispH / 2) + (int)g_pan.y;
+		area.z = (int)dispW;
+		area.w = (int)dispH;
 	}
 	else {
 		size = { 800,800 };
@@ -327,46 +382,83 @@ void optionGUI() {
     ImGui::Begin("Option");
     ImGui::SetWindowPos({ 0, selectWindowSize.y });
 	char str[100];
-	sprintf_s(str, 100, "Box List Size : %zu", boxList.size());
+	sprintf_s(str, 100, "Boxes : %zu", boxList.size());
 	ImGui::Text(str);
 
 	ImGui::Separator();
-	ImGui::Text("Exit Mode : ctrl + c");
-	ImGui::Text("Capture Mode : ctrl + x");
-	ImGui::Text("Capture Box : ctrl + s");
-	ImGui::Text("Reset Capture : ctrl + r");
+	ImGui::Text("Hotkeys");
+	ImGui::Text("Exit : Ctrl+C");
+	ImGui::Text("Capture : Ctrl+X");
+	ImGui::Text("Save Box : Ctrl+S");
+	ImGui::Text("Clear Boxes : Ctrl+R");
 	ImGui::Separator();
-	ImGui::Text("Close Image : ctrl + w");
-    ImGui::Text("Delete Image : ctrl + z");
+	ImGui::Text("Close Image : Ctrl+W");
+    ImGui::Text("Delete Image : Ctrl+Z");
     ImGui::Separator();
 
     // Flip options (apply immediately to all images)
     bool prevH = g_flipHorizontal;
     bool prevV = g_flipVertical;
-    ImGui::Checkbox("Flip Horizontal", &g_flipHorizontal);
+    ImGui::Text("Flip");
+    ImGui::Checkbox("Horizontal", &g_flipHorizontal);
     ImGui::SameLine();
-    ImGui::Checkbox("Flip Vertical", &g_flipVertical);
+    ImGui::Checkbox("Vertical", &g_flipVertical);
     if (prevH != g_flipHorizontal || prevV != g_flipVertical) {
         rebuildAllFromOriginals();
     }
 
 	//ImGui::Checkbox("Free", &isFree);
 	// Box mode
-	const char* modes[] = { "Free", "Keep Aspect", "Square" };
+	ImGui::Separator();
+	ImGui::Text("Box");
+	const char* modes[] = { "Free", "Keep Aspect", "Square", "Custom Ratio" };
 	int m = (int)g_boxMode;
 
-	if (ImGui::Combo("Box Mode", &m, modes, IM_ARRAYSIZE(modes))) {
+	if (ImGui::Combo("Mode", &m, modes, IM_ARRAYSIZE(modes))) {
 		g_boxMode = (BoxMode)m;
 	}
-
+	bool custom = (g_boxMode == BoxMode::CustomRatio);
+	if (!custom) ImGui::BeginDisabled();
+	float ratio[2] = { g_customRatioW, g_customRatioH };
+	if (ImGui::InputFloat2("Ratio W:H", ratio, "%.2f")) {
+		g_customRatioW = std::max(0.01f, ratio[0]);
+		g_customRatioH = std::max(0.01f, ratio[1]);
+	}
+	if (!custom) ImGui::EndDisabled();
 	ImGui::TextDisabled("Hold Shift: Square");
+    if (textureName != "-1") {
+        ImGui::Text("Rotate");
+        ImGui::SameLine();
+        if (ImGui::Button("Rotate -90")) { g_rotationSteps[textureName]--; rebuildImageFromOriginal(textureName); }
+        ImGui::SameLine();
+        if (ImGui::Button("Rotate +90")) { g_rotationSteps[textureName]++; rebuildImageFromOriginal(textureName); }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Rot")) { g_rotationSteps[textureName] = 0; rebuildImageFromOriginal(textureName); }
+        ImGui::TextDisabled("Middle-click: pan | Wheel: zoom | M: nudge current box");
+    }
 	
-	ImGui::DragInt("Box Size", &boxSize, 1, 1, 20);
-    ImGui::ColorEdit4("Color", (float*)&color);
+	ImGui::DragInt("Line", &boxSize, 1, 1, 20);
+    ImGui::ColorEdit4("Box Color", (float*)&color);
+    ImGui::Text("Presets");
+    for (int i = 0; i < 6; ++i) {
+        ImGui::PushID(i);
+        ImVec4 c = g_colorPresets[i];
+        if (ImGui::ColorButton("##preset", c, ImGuiColorEditFlags_NoTooltip, ImVec2(20, 20))) {
+            color = c;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Set")) {
+            g_colorPresets[i] = color;
+            saveColorPresets();
+        }
+        if (i != 5) ImGui::SameLine();
+        ImGui::PopID();
+    }
     ImGui::Separator();
     // Square base mode (temporary ROI from short side)
     bool prevROI = g_squareBaseMode;
-    ImGui::Checkbox("Square Base Mode (short side)", &g_squareBaseMode);
+    ImGui::Text("ROI");
+    ImGui::Checkbox("Square Base", &g_squareBaseMode);
     if (prevROI != g_squareBaseMode) {
         if (g_squareBaseMode) {
             if (!g_roiPrevBoxModeSaved) { g_roiPrevBoxMode = g_boxMode; g_roiPrevBoxModeSaved = true; }
@@ -377,16 +469,21 @@ void optionGUI() {
     }
     ImGui::SameLine();
     if (g_squareBaseROIEnabled) {
-        if (ImGui::Button("Clear Square Base")) {
+        if (ImGui::Button("Clear Base")) {
             g_squareBaseROIEnabled = false;
             g_squareBaseROI = ImVec4(0,0,0,0);
         }
     }
-    ImGui::TextDisabled("Temporary square ROI; applied only on Save");
+    ImGui::TextDisabled("Temp ROI; applied on Save");
     ImGui::Separator();
     // Save options
-	ImGui::Checkbox("Save Right Grid (1/2)", &g_saveComposeRight);
-	ImGui::TextDisabled("Compose crops to the right (2 per column)");
+    ImGui::Text("Save");
+	ImGui::Checkbox("Right Grid", &g_saveComposeRight);
+	ImGui::TextDisabled("Crops on the right (2 per column)");
+    ImGui::Checkbox("Crop Plain", &g_saveCropPlain);
+    ImGui::SameLine();
+    ImGui::Checkbox("Crop Border", &g_saveCropBordered);
+    ImGui::DragInt("Border Thickness", &g_cropBorderSize, 1, 0, 50);
     // Bottom-right aligned Save/Reset buttons
     {
         ImGuiStyle& style = ImGui::GetStyle();
@@ -397,7 +494,7 @@ void optionGUI() {
         float total_w = bw_save + style.ItemSpacing.x + bw_reset;
         if (avail.y > btn_h) ImGui::Dummy(ImVec2(1.0f, avail.y - btn_h));
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - total_w);
-        if (ImGui::Button("Save Images")) callbackSave();
+        if (ImGui::Button("Save")) callbackSave();
         ImGui::SameLine();
         if (ImGui::Button("Reset")) { resetAll(); }
     }
@@ -502,7 +599,14 @@ void callbackSave() {
 	buffer += timeString.str();
 	initSaveFolder(buffer);
 
-    
+    int minImgH = 0;
+    for (const auto& kv : imageSize) {
+        int h = kv.second.second;
+        if (h <= 0) continue;
+        if (minImgH == 0 || h < minImgH) minImgH = h;
+    }
+    int refH = (minImgH > 0) ? minImgH : g_refHeight;
+
     for (auto& it : imagesCV) {
         int cropI = 0;
         auto& name = it.first;
@@ -515,7 +619,25 @@ void callbackSave() {
                 cropI++;
                 drawRect(&mat, save.first, save.second, imageSize[name], boxSize);
                 std::string cropName = std::to_string(cropI) + "_" + name;
-                saveImage(cropMat(&it.second, save.first, imageSize[name]), buffer, cropName);
+                cv::Mat crop = cropMat(&it.second, save.first, imageSize[name]);
+                if (g_saveCropPlain) {
+                    saveImage(crop.clone(), buffer, cropName);
+                }
+                if (g_saveCropBordered && !crop.empty()) {
+                    cv::Mat bordered = crop.clone();
+                    COLORREF bcol = RGB((int)(save.second.x * 255), (int)(save.second.y * 255), (int)(save.second.z * 255));
+                    int w = bordered.cols - 1;
+                    int h = bordered.rows - 1;
+                    int tscaled = std::max(0, scaledThickness(g_cropBorderSize, bordered.rows, refH));
+                    for (int t = 0; t < tscaled; ++t) {
+                        int rw = w - t * 2;
+                        int rh = h - t * 2;
+                        if (rw <= 0 || rh <= 0) break;
+                        drawRect(&bordered, bcol, rw, rh, 0 + t, 0 + t + rh, 0 + t, 0 + t + rw);
+                    }
+                    std::string borderName = std::string("b_") + cropName;
+                    saveImage(bordered, buffer, borderName);
+                }
                 entries.push_back(save);
             }
             saveImage(mat, buffer, name);
@@ -559,7 +681,25 @@ void callbackSave() {
                 entries.push_back({ local, save.second });
                 cropI++;
                 std::string cropName = std::to_string(cropI) + "_" + name;
-                saveImage(cropMat(&base, local, roiSize), buffer, cropName);
+                cv::Mat crop = cropMat(&base, local, roiSize);
+                if (g_saveCropPlain) {
+                    saveImage(crop.clone(), buffer, cropName);
+                }
+                if (g_saveCropBordered && !crop.empty()) {
+                    cv::Mat bordered = crop.clone();
+                    COLORREF bcol = RGB((int)(save.second.x * 255), (int)(save.second.y * 255), (int)(save.second.z * 255));
+                    int w = bordered.cols - 1;
+                    int h = bordered.rows - 1;
+                    int tscaled = std::max(0, scaledThickness(g_cropBorderSize, bordered.rows, refH));
+                    for (int t = 0; t < tscaled; ++t) {
+                        int rw = w - t * 2;
+                        int rh = h - t * 2;
+                        if (rw <= 0 || rh <= 0) break;
+                        drawRect(&bordered, bcol, rw, rh, 0 + t, 0 + t + rh, 0 + t, 0 + t + rw);
+                    }
+                    std::string borderName = std::string("b_") + cropName;
+                    saveImage(bordered, buffer, borderName);
+                }
             }
             // draw boxes on ROI base (copy first)
             cv::Mat mat = base.clone();
@@ -581,6 +721,7 @@ void resetAll() {
     imagesCVOriginal.clear();
 	imageSize.clear();
 	onWindow.clear();
+    g_rotationSteps.clear();
 
 	// 2) 박스/선택 상태 초기화
 	boxList.clear();
@@ -590,6 +731,9 @@ void resetAll() {
 	// 3) 뷰/스케일/표시 색상 등 초기값 복구
 	area = ImVec4(0, 0, 800, 800);
 	scale = 1.0f;
+    g_zoom = 1.0f;
+    g_pan = ImVec2(0,0);
+    g_manualNudgeMode = false;
 
 	// UI 옵션들(네가 쓰는 기본값으로 맞춰줘)
 	boxSize = 2;                  // 기본 선 두께 (원래 기본값 쓰세요)
@@ -615,6 +759,19 @@ void resetAll() {
 
 
 // --- Flip helpers ---
+static cv::Mat applyRotation(const cv::Mat& rgb, int steps) {
+    if (rgb.empty()) return rgb;
+    int s = ((steps % 4) + 4) % 4;
+    if (s == 0) return rgb.clone();
+    cv::Mat out;
+    int flag = cv::ROTATE_90_CLOCKWISE;
+    if (s == 1) flag = cv::ROTATE_90_CLOCKWISE;
+    else if (s == 2) flag = cv::ROTATE_180;
+    else if (s == 3) flag = cv::ROTATE_90_COUNTERCLOCKWISE;
+    cv::rotate(rgb, out, flag);
+    return out;
+}
+
 static cv::Mat applyFlips(const cv::Mat& rgb) {
     if (rgb.empty()) return rgb;
     if (!g_flipHorizontal && !g_flipVertical) return rgb.clone();
@@ -641,13 +798,21 @@ static void updateTextureFromRGB(const std::string& name, const cv::Mat& rgb) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+static void rebuildImageFromOriginal(const std::string& name) {
+    auto itOrig = imagesCVOriginal.find(name);
+    if (itOrig == imagesCVOriginal.end()) return;
+    int steps = 0;
+    auto itRot = g_rotationSteps.find(name);
+    if (itRot != g_rotationSteps.end()) steps = itRot->second;
+    cv::Mat work = applyRotation(itOrig->second, steps);
+    work = applyFlips(work);
+    imagesCV[name] = work;
+    imageSize[name] = { work.cols, work.rows };
+    updateTextureFromRGB(name, work);
+}
+
 static void rebuildAllFromOriginals() {
     for (const auto& kv : imagesCVOriginal) {
-        const std::string& name = kv.first;
-        const cv::Mat& orig = kv.second;
-        cv::Mat work = applyFlips(orig);
-        imagesCV[name] = work;
-        // size remains unchanged by flip
-        updateTextureFromRGB(name, work);
+        rebuildImageFromOriginal(kv.first);
     }
 }

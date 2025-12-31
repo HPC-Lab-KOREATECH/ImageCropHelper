@@ -85,6 +85,13 @@ static inline void ApplyAspectByMode(ImVec4& b, BoxMode mode, const ImVec4& area
 		if (dx > dy * target) dy = dx / target;
 		else                  dx = dy * target;
 	}
+	else if (mode == BoxMode::CustomRatio) {
+		float rw = (g_customRatioW > 0.0f) ? g_customRatioW : 1.0f;
+		float rh = (g_customRatioH > 0.0f) ? g_customRatioH : 1.0f;
+		float target = rw / rh;
+		if (dx > dy * target) dy = dx / target;
+		else                  dx = dy * target;
+	}
 
 	b = ImVec4(x0, y0, x0 + sgnx * dx, y0 + sgny * dy);
 	NormalizeClamp(b);
@@ -194,6 +201,27 @@ void updateSquareBaseMode() {
     }
 }
 
+// Mouse wheel zoom for capture mode (pixelated zoom, no interpolation changes here)
+inline void updateZoom() {
+    if (textureName == "-1") { g_zoom = 1.0f; return; }
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+    if (io.MouseWheel != 0.0f) {
+        g_zoom = std::clamp(g_zoom + io.MouseWheel * 0.15f, 0.2f, 8.0f);
+    }
+}
+
+// Middle-mouse drag pans the zoomed image
+inline void updatePan() {
+    if (textureName == "-1") { g_pan = ImVec2(0,0); return; }
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
+        g_pan.x += io.MouseDelta.x;
+        g_pan.y += io.MouseDelta.y;
+    }
+}
+
 
 void updateKeyboard(std::string name) {
 	ImGuiIO& io = ImGui::GetIO();
@@ -210,11 +238,15 @@ void updateKeyboard(std::string name) {
 		imagesGL.erase(name);
 		imagesCV.erase(name);
 		imagesCVOriginal.erase(name);
+        g_rotationSteps.erase(name);
 		imageSize.erase(name);
 	}
 	if (io.KeysDown['X'] && textureName == "-1") {
 		onWindow[name] = false;
 		textureName = name;
+        g_zoom = 1.0f;
+        g_pan = ImVec2(0,0);
+        g_manualNudgeMode = false;
 	}
 
 }
@@ -229,6 +261,9 @@ void updateKeyboard() {
 	if (io.KeysDown['C'] && textureName != "-1") {
 		onWindow[textureName] = true;
 		textureName = "-1";
+        g_zoom = 1.0f;
+        g_pan = ImVec2(0,0);
+        g_manualNudgeMode = false;
 	}
 	if (io.KeysDown['R']) 
 		boxList.clear();
@@ -273,4 +308,35 @@ inline void updateQuickKeys() {
     }
 
     prevQ = q; prevE = e;
+}
+
+// Toggle manual nudge (M) then move current box with arrow keys
+inline void updateBoxNudge() {
+    if (textureName == "-1") return;
+    ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsWindowFocused() || ImGui::IsWindowHovered()) return;
+
+    static bool prevM = false;
+    bool m = io.KeysDown['M'];
+    if (m && !prevM) g_manualNudgeMode = !g_manualNudgeMode;
+    prevM = m;
+    if (!g_manualNudgeMode) return;
+
+    float step = io.KeyShift ? 0.01f : 0.002f;
+    auto nudge = [&](float dx, float dy) {
+        currBox.x += dx; currBox.z += dx;
+        currBox.y += dy; currBox.w += dy;
+        NormalizeClamp(currBox);
+        if (g_squareBaseROIEnabled) {
+            currBox.x = std::clamp(currBox.x, g_squareBaseROI.x, g_squareBaseROI.z);
+            currBox.z = std::clamp(currBox.z, g_squareBaseROI.x, g_squareBaseROI.z);
+            currBox.y = std::clamp(currBox.y, g_squareBaseROI.y, g_squareBaseROI.w);
+            currBox.w = std::clamp(currBox.w, g_squareBaseROI.y, g_squareBaseROI.w);
+        }
+    };
+
+    if (io.KeysDown[VK_LEFT])  nudge(-step, 0.f);
+    if (io.KeysDown[VK_RIGHT]) nudge(step, 0.f);
+    if (io.KeysDown[VK_UP])    nudge(0.f, -step);
+    if (io.KeysDown[VK_DOWN])  nudge(0.f, step);
 }

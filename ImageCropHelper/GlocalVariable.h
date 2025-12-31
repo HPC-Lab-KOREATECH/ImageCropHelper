@@ -27,8 +27,10 @@ static int boxSize = 1;
 
 //static bool isFree = true;
 //static bool isSquare = false; 
-enum class BoxMode { Free, KeepAspect, Square };
+enum class BoxMode { Free, KeepAspect, Square, CustomRatio };
 BoxMode g_boxMode = BoxMode::Free;
+static float g_customRatioW = 1.0f;
+static float g_customRatioH = 1.0f;
 
 // Square base-cropping mode (fit to shorter side, follow mouse, click to crop base)
 static bool g_squareBaseMode = false;
@@ -42,9 +44,19 @@ static BoxMode g_roiPrevBoxMode = BoxMode::Free;
 
 static std::string textureName = "-1";
 static ImVec4 color = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+static ImVec4 g_colorPresets[6] = {
+    ImVec4(1.0f, 0.0f, 0.0f, 1.0f),
+    ImVec4(0.0f, 1.0f, 0.0f, 1.0f),
+    ImVec4(0.0f, 0.5f, 1.0f, 1.0f),
+    ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+    ImVec4(1.0f, 0.0f, 1.0f, 1.0f),
+    ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+};
 static ImVec4 area;
 static ImVec4 currBox = {0,0,0,0};
 static float scale = 1.f;
+static float g_zoom = 1.0f;
+static ImVec2 g_pan = ImVec2(0, 0);
 static ImVec2 selectWindowSize;
 static ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 static bool done = false;
@@ -53,9 +65,15 @@ static bool g_saveComposeRight = false; // Save full image with right-side 1/2 g
 static int g_tileBorderSize = 2;        // Border thickness for tiles/crops in pixels
 static bool g_saveCropPlain = true;      // Save cropped images without border
 static bool g_saveCropBordered = false;  // Also save cropped images with border
+static int g_cropBorderSize = 2;         // Border thickness for saved crops
 static int g_refHeight = 1000;          // Reference height for thickness scaling
 
 // Global flip state (applies to all images in memory)
 static bool g_flipHorizontal = false;
 static bool g_flipVertical = false;
 
+// Rotation per image (90 deg steps)
+static std::map<std::string, int> g_rotationSteps;
+
+// Manual nudge mode for current box
+static bool g_manualNudgeMode = false;
